@@ -1,0 +1,9 @@
+# Local build of ccline (fork branch samhv/reset-bar, ~/workspace/oss/CCometixLine).
+# ~/.config/mise/config.local.toml points the ccline tool at dist/ with a path: version.
+[tasks.install]
+description = "Build the release binary and copy it to dist/ccline, where mise finds it"
+run = [
+  "cargo build --release",
+  "mkdir -p dist",
+  "cp target/release/ccometixline dist/ccline",
+]
