@@ -2,6 +2,7 @@
 //! the mod bridge) and produces a `Reading` — text fields plus optional
 //! numbers for graphs — without knowing how it will be displayed.
 
+mod agy;
 mod code;
 mod custom;
 pub mod fmt;
@@ -273,6 +274,7 @@ pub fn catalog() -> &'static [Metric] {
     CATALOG.get_or_init(|| {
         let mut all = Vec::new();
         all.extend(identity::metrics());
+        all.extend(agy::metrics());
         all.extend(usage::metrics());
         all.extend(projection::metrics());
         all.extend(code::metrics());

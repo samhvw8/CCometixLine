@@ -80,7 +80,7 @@ fn run(subagent: bool) {
     let frame = Frame {
         now,
         tz,
-        width: statusline::budget(&config, &settings),
+        width: statusline::budget_for_input(&input, &config, &settings),
         git: GitSource::Cached(config.git.cache_ms),
         state: view,
         compact: settings.auto_compact(),

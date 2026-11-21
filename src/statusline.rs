@@ -68,6 +68,27 @@ pub fn budget(config: &Config, settings: &ClaudeSettings) -> Option<usize> {
     Some(width.saturating_sub(2 * (FOOTER_PADDING + padding) + config.layout.reserve as usize))
 }
 
+/// Width budget that honors `terminal_width` reported by Antigravity CLI (`agy`)
+/// without subtracting Claude Code's footer padding.
+pub fn budget_for_input(
+    input: &Input,
+    config: &Config,
+    settings: &ClaudeSettings,
+) -> Option<usize> {
+    if !input.is_antigravity() {
+        return budget(config, settings);
+    }
+    let width = config
+        .layout
+        .width
+        .0
+        .map(usize::from)
+        .or(input.terminal_width)
+        .or_else(crate::env::columns)?;
+    let padding = config.layout.padding.0.map(usize::from).unwrap_or(0);
+    Some(width.saturating_sub(2 * padding + config.layout.reserve as usize))
+}
+
 pub fn lines(input: &Input, config: &Config, registry: &Registry, frame: Frame) -> Vec<Line> {
     let theme = theme(config);
     if let Some(v) = input.cc_version()
@@ -482,5 +503,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn renders_antigravity_without_claude_code_version_gate() {
+        let now = 1_783_324_232;
+        let json = r#"{
+            "product": "antigravity",
+            "version": "1.5.14",
+            "cwd": "/w/app",
+            "model": {"id": "Gemini 4 Neon (Medium)", "display_name": "Gemini 4 Neon (Medium)", "effort": "medium"},
+            "context_window": {"total_input_tokens": 50000, "context_window_size": 1000000, "used_percentage": 5.0},
+            "terminal_width": 100
+        }"#;
+        let input = Input::parse_at(json, now).unwrap();
+        let config = presets::get("minimal").unwrap();
+        let settings = ClaudeSettings::default();
+        assert_eq!(budget_for_input(&input, &config, &settings), Some(100));
+        let frame = Frame {
+            now,
+            tz: FixedOffset::east_opt(0).unwrap(),
+            width: budget_for_input(&input, &config, &settings),
+            git: GitSource::Fixed(None),
+            state: StateView::default(),
+            compact: AutoCompact::default(),
+            commands: Commands::Show,
+        };
+        let out: Vec<String> = lines(&input, &config, &Registry::default(), frame)
+            .iter()
+            .map(|l| line_text(l))
+            .collect();
+        assert_eq!(out, vec!["Gemini 4 Neon · Med · 5%"]);
     }
 }

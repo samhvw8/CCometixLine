@@ -64,6 +64,61 @@ pub struct Input {
     pub pr: Option<PullRequest>,
     #[serde(deserialize_with = "lenient")]
     pub worktree: Option<Worktree>,
+    // Antigravity CLI (`agy`) fields
+    #[serde(deserialize_with = "lenient")]
+    pub product: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub conversation_id: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub conversation_title: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub quota: Option<BTreeMap<String, AgyQuotaBucket>>,
+    #[serde(deserialize_with = "lenient")]
+    pub agent_state: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub cycle_mode: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub sandbox: Option<AgySandbox>,
+    #[serde(deserialize_with = "lenient_list")]
+    pub subagents: Vec<AgySubagent>,
+    #[serde(deserialize_with = "lenient")]
+    pub artifact_count: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    pub task_count: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    pub pending_input_count: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    pub tool_confirmation_pending: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    pub plan_tier: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub email: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub terminal_width: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct AgyQuotaBucket {
+    pub remaining_fraction: Option<f64>,
+    pub remaining_amount: Option<f64>,
+    pub reset_time: Option<String>,
+    pub reset_in_seconds: Option<f64>,
+    pub disabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct AgySandbox {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct AgySubagent {
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -71,6 +126,7 @@ pub struct Input {
 pub struct Model {
     pub id: Option<String>,
     pub display_name: Option<String>,
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -101,6 +157,9 @@ pub struct OutputStyle {
 #[serde(default)]
 pub struct Cost {
     pub total_cost_usd: Option<f64>,
+    pub total_usd: Option<f64>,
+    pub subagent_usd: Option<f64>,
+    pub estimated: Option<bool>,
     pub total_duration_ms: Option<f64>,
     pub total_api_duration_ms: Option<f64>,
     pub total_lines_added: Option<u64>,
@@ -332,6 +391,7 @@ impl Task {
             model: self.model.clone().map(|id| Model {
                 id: Some(id),
                 display_name: None,
+                effort: None,
             }),
             workspace: Some(Workspace {
                 current_dir: cwd,
@@ -354,10 +414,93 @@ pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 impl Input {
     pub fn parse(json: &str) -> serde_json::Result<Input> {
-        serde_json::from_str(json)
+        Self::parse_at(json, chrono::Utc::now().timestamp())
+    }
+
+    pub fn parse_at(json: &str, now: i64) -> serde_json::Result<Input> {
+        let mut input: Input = serde_json::from_str(json)?;
+        input.normalize_antigravity(now);
+        Ok(input)
+    }
+
+    /// True when the payload comes from Antigravity CLI (`agy`).
+    pub fn is_antigravity(&self) -> bool {
+        self.product
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("antigravity") || p.starts_with("antigravity"))
+    }
+
+    /// Map Antigravity CLI's JSON shape into the shared `Input` fields so all
+    /// built-in metrics (model, effort, session name, cost, rate limits) work
+    /// identically without breaking Claude Code payloads.
+    fn normalize_antigravity(&mut self, now: i64) {
+        if !self.is_antigravity() {
+            return;
+        }
+        if self.session_id.as_deref().is_none_or(str::is_empty) {
+            self.session_id = self
+                .conversation_id
+                .clone()
+                .filter(|s| !s.is_empty());
+        }
+        if self.session_name.as_deref().is_none_or(str::is_empty) {
+            self.session_name = self
+                .conversation_title
+                .clone()
+                .filter(|s| !s.is_empty());
+        }
+        if self.effort.is_none()
+            && let Some(level) = self
+                .model
+                .as_ref()
+                .and_then(|m| m.effort.clone())
+                .filter(|s| !s.is_empty())
+        {
+            self.effort = Some(Effort { level: Some(level) });
+        }
+        // `agy` often embeds "(Medium)" / "(High)" inside `model.display_name`
+        // alongside `model.effort`. Strip that suffix so `model` renders
+        // `Gemini 4 Neon · Med` instead of `Gemini 4 Neon (Medium) · Med`.
+        if let Some(level) = self
+            .effort
+            .as_ref()
+            .and_then(|e| e.level.as_deref())
+            .filter(|s| !s.is_empty())
+            && let Some(model) = self.model.as_mut()
+            && let Some(name) = model.display_name.as_deref()
+            && let Some(stripped) = strip_effort_suffix(name, level)
+        {
+            model.display_name = Some(stripped.to_string());
+        }
+        if let Some(cost) = self.cost.as_mut()
+            && cost.total_cost_usd.is_none()
+        {
+            cost.total_cost_usd = cost.total_usd;
+        }
+        if self.rate_limits.is_none()
+            && let Some(quota) = self.quota.as_ref()
+        {
+            let model_hint = self
+                .model
+                .as_ref()
+                .map(|m| {
+                    format!(
+                        "{} {}",
+                        m.id.as_deref().unwrap_or_default(),
+                        m.display_name.as_deref().unwrap_or_default()
+                    )
+                })
+                .unwrap_or_default();
+            if let Some(rl) = agy_quota_to_rate_limits(quota, &model_hint, now) {
+                self.rate_limits = Some(rl);
+            }
+        }
     }
 
     pub fn cc_version(&self) -> Option<Version> {
+        if self.is_antigravity() {
+            return None;
+        }
         self.version.as_deref().and_then(Version::parse)
     }
 
@@ -374,6 +517,124 @@ impl Input {
     pub fn model_id(&self) -> Option<&str> {
         self.model.as_ref().and_then(|m| m.id.as_deref())
     }
+}
+
+fn strip_effort_suffix<'a>(display_name: &'a str, effort: &str) -> Option<&'a str> {
+    let trimmed = display_name.trim_end();
+    let open = trimmed.rfind(" (")?;
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let inside = &trimmed[open + 2..trimmed.len() - 1];
+    if inside.eq_ignore_ascii_case(effort) {
+        Some(trimmed[..open].trim_end())
+    } else {
+        None
+    }
+}
+
+fn agy_quota_to_rate_limits(
+    quota: &BTreeMap<String, AgyQuotaBucket>,
+    model_hint: &str,
+    now: i64,
+) -> Option<RateLimits> {
+    let model = model_hint.to_lowercase();
+    let is_3p = ["claude", "opus", "sonnet", "haiku", "gpt", "o1", "o3", "o4"]
+        .iter()
+        .any(|k| model.contains(k));
+    let is_argon = model.contains("argon");
+
+    let score_family = |key: &str| -> i32 {
+        let k = key.to_lowercase();
+        if is_3p {
+            if k.starts_with("3p") || k.contains("claude") || k.contains("gpt") {
+                30
+            } else if k.starts_with("gemini") {
+                0
+            } else {
+                10
+            }
+        } else if is_argon {
+            if k.contains("argon") {
+                30
+            } else if k.starts_with("gemini") {
+                20
+            } else if k.starts_with("3p") {
+                0
+            } else {
+                10
+            }
+        } else if k.starts_with("gemini") && !k.contains("argon") {
+            30
+        } else if k.starts_with("gemini") {
+            15
+        } else if k.starts_with("3p") {
+            0
+        } else {
+            10
+        }
+    };
+
+    let to_window = |b: &AgyQuotaBucket| -> Option<Window> {
+        if b.disabled == Some(true) {
+            return None;
+        }
+        let used_percentage = b
+            .remaining_fraction
+            .map(|f| ((1.0 - f).clamp(0.0, 1.0)) * 100.0)?;
+        let resets_at = b
+            .reset_time
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp() as f64)
+            .or_else(|| b.reset_in_seconds.map(|s| now as f64 + s));
+        Some(Window {
+            used_percentage: Some(used_percentage),
+            resets_at,
+        })
+    };
+
+    let is_five_hour = |key: &str, b: &AgyQuotaBucket| -> bool {
+        let k = key.to_lowercase();
+        if k.contains("5h") || k.contains("5-hour") || k.contains("short") {
+            return true;
+        }
+        if k.contains("weekly") || k.contains("7d") || k.contains("week") {
+            return false;
+        }
+        b.reset_in_seconds.is_some_and(|s| s > 0.0 && s <= 6.0 * 3600.0)
+    };
+
+    let is_seven_day = |key: &str, b: &AgyQuotaBucket| -> bool {
+        let k = key.to_lowercase();
+        if k.contains("weekly") || k.contains("7d") || k.contains("week") {
+            return true;
+        }
+        if k.contains("5h") || k.contains("5-hour") || k.contains("short") {
+            return false;
+        }
+        b.reset_in_seconds.is_some_and(|s| s > 6.0 * 3600.0)
+    };
+
+    let pick = |predicate: &dyn Fn(&str, &AgyQuotaBucket) -> bool| -> Option<Window> {
+        quota
+            .iter()
+            .filter(|(k, b)| predicate(k, b))
+            .filter_map(|(k, b)| Some((score_family(k), to_window(b)?)))
+            .max_by_key(|(score, _)| *score)
+            .map(|(_, w)| w)
+    };
+
+    let five_hour = pick(&is_five_hour);
+    let seven_day = pick(&is_seven_day);
+    if five_hour.is_none() && seven_day.is_none() {
+        return None;
+    }
+    Some(RateLimits {
+        five_hour,
+        seven_day,
+        spend_limit: None,
+    })
 }
 
 #[cfg(test)]
@@ -465,5 +726,84 @@ mod tests {
     fn falls_back_to_cwd() {
         let input = Input::parse(r#"{"cwd": "/a", "workspace": {"current_dir": ""}}"#).unwrap();
         assert_eq!(input.current_dir(), Some("/a"));
+    }
+
+    #[test]
+    fn normalizes_antigravity_payload() {
+        let now = 1_783_324_232;
+        let json = r#"{
+            "cwd": "/home/user/my-project",
+            "conversation_id": "12345678-abcd",
+            "conversation_title": "Explain the factorial function",
+            "transcript_path": "/t.jsonl",
+            "model": {
+                "id": "Gemini 4 Argon (Medium)",
+                "display_name": "Gemini 4 Argon (Medium)",
+                "effort": "medium"
+            },
+            "workspace": {"current_dir": "/home/user/my-project", "project_dir": "/home/user/my-project"},
+            "version": "1.5.14",
+            "context_window": {
+                "total_input_tokens": 88244,
+                "total_output_tokens": 61074,
+                "context_window_size": 1048576,
+                "used_percentage": 14.24,
+                "remaining_percentage": 85.76
+            },
+            "product": "antigravity",
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.75, "reset_in_seconds": 7200},
+                "gemini-weekly": {"remaining_fraction": 0.90, "reset_time": "2026-07-06T07:50:32Z", "reset_in_seconds": 560580},
+                "gemini-argon-wtu-weekly": {"remaining_fraction": 0.60, "reset_in_seconds": 400000},
+                "3p-weekly": {"remaining_fraction": 0.20, "reset_in_seconds": 300000}
+            },
+            "cost": {"total_usd": 0.4213, "subagent_usd": 0, "estimated": false},
+            "terminal_width": 111
+        }"#;
+        let input = Input::parse_at(json, now).unwrap();
+        assert!(input.is_antigravity());
+        assert_eq!(input.cc_version(), None);
+        assert_eq!(input.session_id.as_deref(), Some("12345678-abcd"));
+        assert_eq!(
+            input.session_name.as_deref(),
+            Some("Explain the factorial function")
+        );
+        assert_eq!(
+            input.model.as_ref().and_then(|m| m.display_name.as_deref()),
+            Some("Gemini 4 Argon")
+        );
+        assert_eq!(
+            input.effort.as_ref().and_then(|e| e.level.as_deref()),
+            Some("medium")
+        );
+        assert_eq!(input.cost.as_ref().and_then(|c| c.total_cost_usd), Some(0.4213));
+        assert_eq!(input.terminal_width, Some(111));
+
+        let rl = input.rate_limits.as_ref().unwrap();
+        let h5 = rl.five_hour.as_ref().unwrap();
+        assert!((h5.used_percentage.unwrap() - 25.0).abs() < 1e-6);
+        assert_eq!(h5.resets_at, Some((now + 7200) as f64));
+        // Argon model should pick gemini-argon-wtu-weekly (60% remaining = 40% used)
+        let wk = rl.seven_day.as_ref().unwrap();
+        assert!((wk.used_percentage.unwrap() - 40.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn routes_3p_and_skips_disabled_quota_buckets() {
+        let now = 1_000_000;
+        let json = r#"{
+            "product": "antigravity",
+            "model": {"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5"},
+            "quota": {
+                "gemini-weekly": {"remaining_fraction": 0.95, "reset_in_seconds": 500000},
+                "3p-weekly": {"remaining_fraction": 0.30, "reset_in_seconds": 400000},
+                "3p-5h": {"remaining_fraction": 0.50, "reset_in_seconds": 3600, "disabled": true}
+            }
+        }"#;
+        let input = Input::parse_at(json, now).unwrap();
+        let rl = input.rate_limits.unwrap();
+        assert!(rl.five_hour.is_none());
+        let wk = rl.seven_day.unwrap();
+        assert!((wk.used_percentage.unwrap() - 70.0).abs() < 1e-6);
     }
 }

@@ -656,7 +656,7 @@ mod tests {
             .collect();
         for m in metrics::catalog() {
             let id = m.meta.id;
-            if id == "cmd" || id.starts_with("task.") {
+            if id == "cmd" || id.starts_with("task.") || id.starts_with("agy.") {
                 continue;
             }
             let shown = |name: &str| {
